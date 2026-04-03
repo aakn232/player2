@@ -1,4 +1,5 @@
-﻿# MPV (binary library over 100MB)
+﻿__pycache__/
+# MPV (binary library over 100MB)
 mpv/
 
 # Samples
