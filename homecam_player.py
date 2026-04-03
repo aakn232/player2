@@ -2,20 +2,17 @@ from __future__ import annotations
 
 import argparse
 import bisect
-import json
+import locale
+import os
 import re
-import shutil
-import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 
-from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QPainter
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -34,6 +31,39 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+
+def _bootstrap_mpv_dll_path() -> None:
+    if os.name != "nt":
+        return
+
+    candidates = [
+        Path(__file__).resolve().parent / "mpv",
+        Path.cwd() / "mpv",
+    ]
+
+    for folder in candidates:
+        dll = folder / "libmpv-2.dll"
+        if not dll.exists():
+            continue
+
+        os.environ["PATH"] = str(folder) + os.pathsep + os.environ.get("PATH", "")
+        try:
+            os.add_dll_directory(str(folder))
+        except (AttributeError, OSError):
+            pass
+        return
+
+
+_bootstrap_mpv_dll_path()
+
+try:
+    import mpv  # type: ignore[import-not-found]
+except Exception as exc:  # pragma: no cover - runtime environment dependent
+    mpv = None
+    MPV_IMPORT_ERROR = str(exc)
+else:
+    MPV_IMPORT_ERROR = ""
+
 DEFAULT_SEGMENT_MS = 60_000
 FILE_TIME_RE = re.compile(r"(?P<mm>\d{2})M(?P<ss>\d{2})S(?:_(?P<ts>\d+))?", re.IGNORECASE)
 FOLDER_TIME_RE = re.compile(r"^\d{10}$")
@@ -42,6 +72,7 @@ SETTINGS_APP = "timeline-player"
 SETTINGS_LAST_FOLDER = "last_open_folder"
 SETTINGS_VOLUME = "volume"
 GAP_THRESHOLD_MS = 10_000
+SCRUB_PREVIEW_INTERVAL_MS = 33
 
 
 @dataclass
@@ -105,11 +136,8 @@ class ClickableSlider(QSlider):
                 int(event.position().x()),
                 self.width(),
             )
-            self.setValue(value)
+            self.setSliderPosition(value)
             self.sliderMoved.emit(value)
-            self.sliderReleased.emit()
-            event.accept()
-            return
         super().mousePressEvent(event)
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
@@ -180,69 +208,57 @@ def parse_source_datetime(path: Path) -> Optional[datetime]:
     return None
 
 
-def _quick_mp4_header_check(file_path: Path) -> tuple[bool, str]:
+def _validate_mp4_with_moov_atom(file_path: Path) -> tuple[bool, str]:
     try:
-        if file_path.stat().st_size <= 1024:
-            return False, "File too small"
-
-        with file_path.open("rb") as f:
-            header = f.read(64)
-        if b"ftyp" not in header:
-            return False, "Missing MP4 ftyp header"
-
-        return True, "ok"
+        file_size = file_path.stat().st_size
     except OSError as exc:
         return False, f"Read error: {exc}"
 
-
-def _probe_mp4_with_ffprobe(ffprobe_path: str, file_path: Path) -> tuple[bool, str, int]:
-    command = [
-        ffprobe_path,
-        "-v",
-        "error",
-        "-print_format",
-        "json",
-        "-show_streams",
-        "-show_format",
-        str(file_path),
-    ]
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, f"ffprobe error: {exc}", DEFAULT_SEGMENT_MS
-
-    if result.returncode != 0:
-        stderr = (result.stderr or "").strip()
-        reason = stderr if stderr else "ffprobe failed"
-        return False, reason, DEFAULT_SEGMENT_MS
+    if file_size < 8:
+        return False, "File too small"
 
     try:
-        payload = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError:
-        return False, "ffprobe output parse failed", DEFAULT_SEGMENT_MS
+        with file_path.open("rb") as f:
+            cursor = 0
+            has_moov = False
 
-    streams = payload.get("streams", [])
-    has_video = any(stream.get("codec_type") == "video" for stream in streams)
-    if not has_video:
-        return False, "No video stream", DEFAULT_SEGMENT_MS
+            while cursor + 8 <= file_size:
+                header = f.read(8)
+                if len(header) < 8:
+                    break
 
-    format_info = payload.get("format", {})
-    duration_raw = format_info.get("duration")
-    if duration_raw is None:
-        return True, "ok (duration unknown)", DEFAULT_SEGMENT_MS
+                atom_size = int.from_bytes(header[0:4], "big")
+                atom_type = header[4:8]
+                header_size = 8
 
-    try:
-        duration_ms = max(1_000, int(float(duration_raw) * 1000))
-    except (TypeError, ValueError):
-        duration_ms = DEFAULT_SEGMENT_MS
+                if atom_size == 1:
+                    extended = f.read(8)
+                    if len(extended) < 8:
+                        return False, "Invalid extended atom size"
+                    atom_size = int.from_bytes(extended, "big")
+                    header_size = 16
+                elif atom_size == 0:
+                    atom_size = file_size - cursor
 
-    return True, "ok", duration_ms
+                if atom_size < header_size:
+                    return False, "Invalid atom size"
+
+                if atom_type == b"moov":
+                    has_moov = True
+                    break
+
+                skip = atom_size - header_size
+                if skip > 0:
+                    f.seek(skip, 1)
+
+                cursor += atom_size
+
+            if not has_moov:
+                return False, "moov atom not found"
+
+            return True, "ok"
+    except OSError as exc:
+        return False, f"Read error: {exc}"
 
 
 def build_segment_index(
@@ -251,18 +267,14 @@ def build_segment_index(
 ) -> tuple[list[Segment], list[ValidationIssue], str]:
     files = sorted(root.rglob("*.mp4"))
     total_files = len(files)
-    ffprobe_path = shutil.which("ffprobe")
-    validation_mode = "ffprobe" if ffprobe_path else "header"
+    validation_mode = "moov-atom"
     invalid_files: list[ValidationIssue] = []
 
     probed: list[Segment] = []
     for index, file_path in enumerate(files, start=1):
         parsed_dt = parse_source_datetime(file_path)
-        if ffprobe_path:
-            is_valid, reason, duration_ms = _probe_mp4_with_ffprobe(ffprobe_path, file_path)
-        else:
-            is_valid, reason = _quick_mp4_header_check(file_path)
-            duration_ms = DEFAULT_SEGMENT_MS
+        is_valid, reason = _validate_mp4_with_moov_atom(file_path)
+        duration_ms = DEFAULT_SEGMENT_MS
 
         if is_valid:
             probed.append(
@@ -341,6 +353,7 @@ class HomecamPlayerWindow(QMainWindow):
         self.current_index = -1
         self.pending_seek_ms: Optional[int] = None
         self.pending_should_play = False
+        self.pending_seek_exact = True
         self.validation_issues: list[ValidationIssue] = []
         self.validation_mode = "unknown"
         self.loaded_root: Optional[Path] = None
@@ -349,12 +362,18 @@ class HomecamPlayerWindow(QMainWindow):
         self.volume_percent = self._load_saved_volume()
         self.unplayable_ranges: list[tuple[int, int, QColor]] = []
         self.virtual_position_ms: Optional[int] = None
+        self.is_scrubbing = False
+        self.scrub_was_playing = False
+        self.pending_scrub_value: Optional[int] = None
         self.is_loading = False
         self.loader_thread: Optional[QThread] = None
         self.loader_worker: Optional[SegmentLoaderWorker] = None
+        self.mpv_ready = False
+        self.last_end_handled_index = -1
 
         self._setup_ui()
         self._setup_player()
+        self._setup_scrub_preview_timer()
         self._setup_timer()
 
     def _setup_ui(self) -> None:
@@ -362,11 +381,14 @@ class HomecamPlayerWindow(QMainWindow):
         layout = QVBoxLayout(root)
         self.setCentralWidget(root)
 
-        self.video_widget = QVideoWidget()
+        self.video_widget = QWidget()
+        self.video_widget.setAttribute(Qt.WA_NativeWindow, True)
+        self.video_widget.setAttribute(Qt.WA_DontCreateNativeAncestors, True)
         layout.addWidget(self.video_widget, 1)
 
         self.timeline_slider = ClickableSlider(Qt.Horizontal)
         self.timeline_slider.setRange(0, 0)
+        self.timeline_slider.sliderPressed.connect(self._on_slider_pressed)
         self.timeline_slider.sliderReleased.connect(self._on_slider_released)
         self.timeline_slider.sliderMoved.connect(self._on_slider_preview)
         layout.addWidget(self.timeline_slider)
@@ -433,21 +455,38 @@ class HomecamPlayerWindow(QMainWindow):
         self.addAction(open_action)
 
     def _setup_player(self) -> None:
-        self.player = QMediaPlayer(self)
-        self.audio_output = QAudioOutput(self)
-        self.player.setAudioOutput(self.audio_output)
-        self.player.setVideoOutput(self.video_widget)
-        self.audio_output.setVolume(self.volume_percent / 100.0)
+        if mpv is None:
+            raise RuntimeError(
+                "python-mpv import failed. Install python-mpv and ensure libmpv-2.dll is in mpv folder. "
+                f"detail: {MPV_IMPORT_ERROR}"
+            )
 
-        self.player.mediaStatusChanged.connect(self._on_media_status_changed)
-        self.player.durationChanged.connect(self._on_duration_changed)
-        self.player.playbackStateChanged.connect(self._on_playback_state_changed)
+        # libmpv requires C numeric locale in GUI apps.
+        locale.setlocale(locale.LC_NUMERIC, "C")
+
+        self.mpv_player = mpv.MPV(
+            wid=str(int(self.video_widget.winId())),
+            input_default_bindings=False,
+            input_vo_keyboard=False,
+            osc=False,
+            keep_open="always",
+        )
+        self.mpv_player.pause = True
+        self.mpv_player.speed = self.playback_rate
+        self.mpv_player.volume = self.volume_percent
+        self.mpv_ready = True
 
     def _setup_timer(self) -> None:
         self.ui_timer = QTimer(self)
         self.ui_timer.setInterval(120)
         self.ui_timer.timeout.connect(self._sync_timeline)
         self.ui_timer.start()
+
+    def _setup_scrub_preview_timer(self) -> None:
+        self.scrub_preview_timer = QTimer(self)
+        self.scrub_preview_timer.setSingleShot(True)
+        self.scrub_preview_timer.setInterval(SCRUB_PREVIEW_INTERVAL_MS)
+        self.scrub_preview_timer.timeout.connect(self._run_scrub_preview)
 
     def _open_folder_dialog(self) -> None:
         if self.is_loading:
@@ -471,7 +510,7 @@ class HomecamPlayerWindow(QMainWindow):
         self.settings.setValue(SETTINGS_LAST_FOLDER, str(root))
         self.validation_issues = []
         self._update_invalid_files_button()
-        self.player.pause()
+        self._pause_playback()
         self.segment_label.setText("")
         self._set_loading_state(True)
 
@@ -545,7 +584,7 @@ class HomecamPlayerWindow(QMainWindow):
         if first_playable is None:
             self.current_index = -1
             self.virtual_position_ms = 0
-            self.player.stop()
+            self._pause_playback()
             self.segment_label.setText("No playable files. Check Invalid Files and timeline marks.")
             return
 
@@ -646,66 +685,165 @@ class HomecamPlayerWindow(QMainWindow):
             return 0
         if self.segments[self.current_index].kind != "media":
             return self.segments[self.current_index].start_ms
-        return self.segments[self.current_index].start_ms + max(0, self.player.position())
+        return self.segments[self.current_index].start_ms + max(0, self._current_file_position_ms())
 
-    def _load_segment(self, index: int, seek_ms: int, should_play: bool) -> None:
+    def _load_segment(self, index: int, seek_ms: int, should_play: bool, seek_exact: bool = True) -> int:
         if index < 0 or index >= len(self.segments):
-            return
+            return 0
 
         segment = self.segments[index]
         if segment.kind != "media" or segment.path is None:
             self.current_index = index
             self.virtual_position_ms = segment.start_ms + max(0, min(seek_ms, segment.duration_ms - 1))
-            self.player.pause()
+            self._pause_playback()
             if segment.kind == "gap":
                 self.segment_label.setText("No recording in this time interval (timeline gap).")
             else:
                 self.segment_label.setText("")
-            return
+            return self.virtual_position_ms
 
         self.current_index = index
         self.virtual_position_ms = None
         self.pending_seek_ms = max(0, seek_ms)
         self.pending_should_play = should_play
+        self.pending_seek_exact = seek_exact
 
         self.segment_label.setText("")
-        self.player.setSource(QUrl.fromLocalFile(str(segment.path)))
-        self.player.setPlaybackRate(self.playback_rate)
+        if not self.mpv_ready:
+            return segment.start_ms + self.pending_seek_ms
 
-    def _seek_global(self, global_ms: int) -> None:
+        self.mpv_player.pause = True
+        self.mpv_player.speed = self.playback_rate
+        self.mpv_player.volume = self.volume_percent
+        self.mpv_player.command("loadfile", str(segment.path), "replace")
+        QTimer.singleShot(0, self._finalize_pending_seek)
+        return segment.start_ms + self.pending_seek_ms
+
+    def _find_previous_playable_index(self, index: int) -> Optional[int]:
+        for prev_index in range(index - 1, -1, -1):
+            seg = self.segments[prev_index]
+            if seg.kind == "media" and seg.path is not None:
+                return prev_index
+        return None
+
+    def _snap_global_to_playable(self, global_ms: int) -> int:
         if not self.segments:
-            return
+            return 0
 
         idx, offset = self._map_global_to_segment(global_ms)
-        should_play = self.player.playbackState() == QMediaPlayer.PlayingState
+        target_segment = self.segments[idx]
+        if target_segment.kind == "media" and target_segment.path is not None:
+            return target_segment.start_ms + offset
+
+        next_playable = self._find_next_playable_index(idx)
+        if next_playable is not None:
+            return self.segments[next_playable].start_ms
+
+        prev_playable = self._find_previous_playable_index(idx)
+        if prev_playable is not None:
+            prev_seg = self.segments[prev_playable]
+            return prev_seg.start_ms + max(0, prev_seg.duration_ms - 1)
+
+        return target_segment.start_ms
+
+    def _seek_global(
+        self,
+        global_ms: int,
+        should_play_override: Optional[bool] = None,
+        seek_exact: bool = True,
+    ) -> int:
+        if not self.segments:
+            return 0
+
+        snapped_global = self._snap_global_to_playable(global_ms)
+        idx, offset = self._map_global_to_segment(snapped_global)
+        if should_play_override is None:
+            should_play = self._is_playing()
+        else:
+            should_play = should_play_override
+
+        target_segment = self.segments[idx]
+        if target_segment.kind != "media" or target_segment.path is None:
+            self._pause_playback()
+            self.virtual_position_ms = target_segment.start_ms
+            return self.virtual_position_ms
 
         if idx == self.current_index:
             segment = self.segments[idx]
             if segment.kind != "media":
                 self.virtual_position_ms = segment.start_ms + offset
                 self._update_time_label(self.virtual_position_ms)
-                return
-            self.player.setPosition(offset)
+                return self.virtual_position_ms
+            self._seek_current_file(offset, exact=seek_exact)
             if should_play:
-                self.player.play()
-            return
+                self._resume_playback()
+            return segment.start_ms + offset
 
-        self._load_segment(idx, seek_ms=offset, should_play=should_play)
+        return self._load_segment(idx, seek_ms=offset, should_play=should_play, seek_exact=seek_exact)
+
+    def _on_slider_pressed(self) -> None:
+        if not self.segments:
+            return
+        self.is_scrubbing = True
+        self.pending_scrub_value = None
+        self.scrub_was_playing = self._is_playing()
+        if self.scrub_was_playing:
+            self._pause_playback()
 
     def _on_slider_preview(self, value: int) -> None:
-        self._seek_global(value)
-        self._update_time_label(value)
+        if not self.segments:
+            return
+
+        snapped = self._snap_global_to_playable(value)
+        self.pending_scrub_value = snapped
+        self._update_time_label(snapped)
+
+        if not self.scrub_preview_timer.isActive():
+            self.scrub_preview_timer.start()
+
+    def _run_scrub_preview(self) -> None:
+        if not self.is_scrubbing or self.pending_scrub_value is None:
+            return
+
+        snapped = self.pending_scrub_value
+        self.pending_scrub_value = None
+
+        self.timeline_slider.blockSignals(True)
+        self.timeline_slider.setValue(max(0, min(snapped, self.timeline_slider.maximum())))
+        self.timeline_slider.blockSignals(False)
+
+        self._seek_global(snapped, should_play_override=False, seek_exact=False)
+        self._update_time_label(snapped)
+
+        if self.pending_scrub_value is not None:
+            self.scrub_preview_timer.start()
 
     def _on_slider_released(self) -> None:
-        self._seek_global(self.timeline_slider.value())
+        if self.scrub_preview_timer.isActive():
+            self.scrub_preview_timer.stop()
+        self.pending_scrub_value = None
+
+        should_resume = self.scrub_was_playing
+        self.is_scrubbing = False
+        self.scrub_was_playing = False
+
+        snapped = self._seek_global(
+            self.timeline_slider.value(),
+            should_play_override=should_resume,
+            seek_exact=True,
+        )
+        self.timeline_slider.blockSignals(True)
+        self.timeline_slider.setValue(max(0, min(snapped, self.timeline_slider.maximum())))
+        self.timeline_slider.blockSignals(False)
+        self._update_time_label(snapped)
 
     def _toggle_play(self) -> None:
         if not self.segments:
             QMessageBox.information(self, "No media", "Load a folder first.")
             return
 
-        if self.player.playbackState() == QMediaPlayer.PlayingState:
-            self.player.pause()
+        if self._is_playing():
+            self._pause_playback()
         else:
             if self.current_index < 0:
                 first_playable = self._find_next_playable_index(-1)
@@ -714,7 +852,7 @@ class HomecamPlayerWindow(QMainWindow):
             else:
                 segment = self.segments[self.current_index]
                 if segment.kind == "media":
-                    self.player.play()
+                    self._resume_playback()
                 else:
                     next_playable = self._find_next_playable_index(self.current_index)
                     if next_playable is not None:
@@ -740,60 +878,111 @@ class HomecamPlayerWindow(QMainWindow):
         self.playback_rate = rate
         for speed, button in self.speed_buttons.items():
             button.setChecked(speed == rate)
-        if hasattr(self, "player"):
-            self.player.setPlaybackRate(self.playback_rate)
+        if hasattr(self, "mpv_player"):
+            self.mpv_player.speed = self.playback_rate
 
     def _on_volume_changed(self, value: int) -> None:
         self.volume_percent = max(0, min(100, value))
-        self.audio_output.setVolume(self.volume_percent / 100.0)
+        if hasattr(self, "mpv_player"):
+            self.mpv_player.volume = self.volume_percent
         self.volume_value_label.setText(f"{self.volume_percent}%")
         self.settings.setValue(SETTINGS_VOLUME, self.volume_percent)
 
-    def _sync_timeline(self) -> None:
-        if not self.segments:
+    def _is_playing(self) -> bool:
+        if not self.mpv_ready:
+            return False
+        try:
+            return not bool(self.mpv_player.pause)
+        except Exception:
+            return False
+
+    def _pause_playback(self) -> None:
+        if self.mpv_ready:
+            self.mpv_player.pause = True
+
+    def _resume_playback(self) -> None:
+        if self.mpv_ready:
+            self.mpv_player.pause = False
+
+    def _seek_current_file(self, ms: int, exact: bool = True) -> None:
+        if not self.mpv_ready:
             return
+        try:
+            mode = "exact" if exact else "keyframes"
+            self.mpv_player.command("seek", max(0.0, ms / 1000.0), "absolute", mode)
+        except Exception:
+            pass
 
-        if self.timeline_slider.isSliderDown():
+    def _current_file_position_ms(self) -> int:
+        if not self.mpv_ready:
+            return 0
+        try:
+            value = self.mpv_player.time_pos
+            if value is None:
+                return 0
+            return max(0, int(float(value) * 1000))
+        except Exception:
+            return 0
+
+    def _current_file_duration_ms(self) -> int:
+        if not self.mpv_ready:
+            return 0
+        try:
+            value = self.mpv_player.duration
+            if value is None:
+                return 0
+            return max(0, int(float(value) * 1000))
+        except Exception:
+            return 0
+
+    def _is_target_file_loaded(self, target_path: Path) -> bool:
+        if not self.mpv_ready:
+            return False
+        try:
+            current_path = self.mpv_player.path
+            if not current_path:
+                return False
+            return Path(str(current_path)).resolve() == target_path.resolve()
+        except Exception:
+            return False
+
+    def _finalize_pending_seek(self) -> None:
+        if self.pending_seek_ms is None:
             return
-
-        global_ms = self._current_global_position()
-        self.timeline_slider.blockSignals(True)
-        self.timeline_slider.setValue(max(0, min(global_ms, self.timeline_slider.maximum())))
-        self.timeline_slider.blockSignals(False)
-        self._update_time_label(global_ms)
-
-    def _on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
-        if status == QMediaPlayer.LoadedMedia:
-            if self.pending_seek_ms is not None:
-                self.player.setPosition(self.pending_seek_ms)
-            if self.pending_should_play:
-                self.player.play()
-            else:
-                self.player.pause()
+        if not (0 <= self.current_index < len(self.segments)):
+            return
+        segment = self.segments[self.current_index]
+        if segment.kind != "media":
             self.pending_seek_ms = None
             return
-
-        if status == QMediaPlayer.EndOfMedia:
-            next_playable = self._find_next_playable_index(self.current_index)
-            if next_playable is not None:
-                self._load_segment(next_playable, seek_ms=0, should_play=True)
-            else:
-                self.player.pause()
-
-    def _find_next_playable_index(self, index: int) -> Optional[int]:
-        for next_index in range(index + 1, len(self.segments)):
-            seg = self.segments[next_index]
-            if seg.kind == "media" and seg.path is not None:
-                return next_index
-        return None
-
-    def _on_duration_changed(self, duration_ms: int) -> None:
-        if self.current_index < 0 or self.current_index >= len(self.segments):
+        if segment.path is None:
+            self.pending_seek_ms = None
             return
-        if duration_ms <= 0:
+        if not self._is_target_file_loaded(segment.path):
+            return
+
+        target_seek = self.pending_seek_ms
+        should_play = self.pending_should_play
+        seek_exact = self.pending_seek_exact
+        self.pending_seek_ms = None
+
+        self._seek_current_file(target_seek, exact=seek_exact)
+        if should_play:
+            self._resume_playback()
+        else:
+            self._pause_playback()
+
+    def _update_current_segment_duration(self) -> None:
+        if self.current_index < 0 or self.current_index >= len(self.segments):
             return
 
         segment = self.segments[self.current_index]
+        if segment.kind != "media":
+            return
+
+        duration_ms = self._current_file_duration_ms()
+        if duration_ms <= 0:
+            return
         if abs(segment.duration_ms - duration_ms) < 300:
             return
 
@@ -803,8 +992,61 @@ class HomecamPlayerWindow(QMainWindow):
         self.timeline_slider.setValue(min(global_before, self.timeline_slider.maximum()))
         self._update_time_label(global_before)
 
-    def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
-        self.play_button.setText("Pause" if state == QMediaPlayer.PlayingState else "Play")
+    def _sync_timeline(self) -> None:
+        if not self.segments:
+            self.play_button.setText("Play")
+            return
+
+        self._finalize_pending_seek()
+        self._update_current_segment_duration()
+
+        if 0 <= self.current_index < len(self.segments):
+            segment = self.segments[self.current_index]
+            if segment.kind == "media" and self.pending_seek_ms is None:
+                duration_ms = self._current_file_duration_ms()
+                position_ms = self._current_file_position_ms()
+                if duration_ms > 0 and position_ms >= max(0, duration_ms - 120):
+                    if self.last_end_handled_index != self.current_index:
+                        self.last_end_handled_index = self.current_index
+                        next_playable = self._find_next_playable_index(self.current_index)
+                        if next_playable is not None:
+                            self._load_segment(next_playable, seek_ms=0, should_play=True)
+                        else:
+                            self._pause_playback()
+                        return
+                else:
+                    self.last_end_handled_index = -1
+
+        if self.timeline_slider.isSliderDown():
+            self.play_button.setText("Pause" if self._is_playing() else "Play")
+            return
+
+        global_ms = self._current_global_position()
+        self.timeline_slider.blockSignals(True)
+        self.timeline_slider.setValue(max(0, min(global_ms, self.timeline_slider.maximum())))
+        self.timeline_slider.blockSignals(False)
+        self._update_time_label(global_ms)
+        self.play_button.setText("Pause" if self._is_playing() else "Play")
+
+    def _find_next_playable_index(self, index: int) -> Optional[int]:
+        for next_index in range(index + 1, len(self.segments)):
+            seg = self.segments[next_index]
+            if seg.kind == "media" and seg.path is not None:
+                return next_index
+        return None
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self.loader_thread is not None and self.loader_thread.isRunning():
+            self.loader_thread.quit()
+            self.loader_thread.wait(2000)
+
+        if hasattr(self, "mpv_player"):
+            try:
+                self.mpv_player.terminate()
+            except Exception:
+                pass
+
+        super().closeEvent(event)
 
 
 def main() -> None:
